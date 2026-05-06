@@ -20,7 +20,7 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 }
 
-const GEMINI_MODEL = 'gemini-2.5-flash-preview-04-17'
+const GEMINI_MODEL = 'gemini-2.0-flash'
 
 interface JobListing {
   title: string
@@ -75,16 +75,25 @@ Deno.serve(async (req) => {
       try {
         let jobs: JobListing[] = []
 
-        // Try direct ATS API first (fast, free)
+        // Try direct ATS API first (fast, free, no tokens)
         const api = detectApi(company)
         if (api) {
           jobs = await scanViaDetectedApi(api, company.name)
           console.log(`[api] ${company.name}: ${jobs.length} jobs`)
         } else {
-          // Fall back to Gemini scraping
-          console.log(`[gemini] ${company.name}: scraping ${company.careers_url}`)
-          jobs = await scanViaGemini(geminiKey, company.name, company.careers_url)
-          console.log(`[gemini] ${company.name}: ${jobs.length} jobs`)
+          // AI scraping fallback — Gemini (url_context) preferred, OpenAI (fetch+parse) second
+          const openaiKey = Deno.env.get('OPENAI_API_KEY')
+          try {
+            console.log(`[gemini] ${company.name}: scraping ${company.careers_url}`)
+            jobs = await scanViaGemini(geminiKey, company.name, company.careers_url)
+            console.log(`[gemini] ${company.name}: ${jobs.length} jobs`)
+          } catch (geminiErr) {
+            console.warn(`[gemini] ${company.name} failed: ${geminiErr}. Trying OpenAI...`)
+            if (openaiKey) {
+              jobs = await scanViaOpenAI(openaiKey, company.name, company.careers_url)
+              console.log(`[openai] ${company.name}: ${jobs.length} jobs`)
+            }
+          }
         }
 
         for (const job of jobs) {
@@ -123,24 +132,9 @@ Deno.serve(async (req) => {
 // ── Gemini scraper ────────────────────────────────────────────────────────────
 
 async function scanViaGemini(apiKey: string, companyName: string, careersUrl: string): Promise<JobListing[]> {
-  const prompt = `You are a job listing extractor.
+  const prompt = buildScrapePrompt(companyName, careersUrl)
 
-Fetch the careers page at: ${careersUrl}
-
-Extract ALL job listings currently posted on that page.
-Return ONLY a JSON array, no markdown, no explanation:
-[
-  { "title": "...", "url": "...", "location": "..." },
-  ...
-]
-
-Rules:
-- Include every job you find, do not filter by relevance
-- URL must be the direct link to the job posting (absolute URL)
-- If no URL is available for a job, use the careers page URL
-- If the page has no jobs, return []
-- Return ONLY the JSON array, nothing else`
-
+  // Try with url_context tool (Gemini 2.0 flash supports it)
   const res = await fetch(
     `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`,
     {
@@ -148,7 +142,7 @@ Rules:
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         contents: [{ parts: [{ text: prompt }] }],
-        tools: [{ url_context: {} }],
+        tools: [{ urlContext: {} }],
         generationConfig: { maxOutputTokens: 4096, temperature: 0 },
       }),
     }
@@ -156,26 +150,81 @@ Rules:
 
   if (!res.ok) {
     const err = await res.text()
-    throw new Error(`Gemini API error: ${err.slice(0, 200)}`)
+    throw new Error(`Gemini API error: ${err.slice(0, 300)}`)
   }
 
   const data = await res.json()
-  const text: string = data.candidates?.[0]?.content?.parts?.[0]?.text ?? '[]'
+  // Concatenate all text parts (url_context may split response)
+  const parts = data.candidates?.[0]?.content?.parts ?? []
+  const text: string = parts.map((p: Record<string, unknown>) => p.text ?? '').join('')
 
-  // Extract JSON array from response
-  const jsonMatch = text.match(/\[\s*[\s\S]*\]/)
+  return parseJobsFromText(text, companyName, careersUrl)
+}
+
+async function scanViaOpenAI(apiKey: string, companyName: string, careersUrl: string): Promise<JobListing[]> {
+  // Fetch page content first, then ask OpenAI to parse it
+  const pageRes = await fetch(careersUrl, {
+    headers: { 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36' },
+    signal: AbortSignal.timeout(15000),
+  })
+  if (!pageRes.ok) throw new Error(`Could not fetch ${careersUrl}: ${pageRes.status}`)
+
+  const html = await pageRes.text()
+  const text = html
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/\s{3,}/g, '\n')
+    .slice(0, 12000)
+
+  const prompt = `${buildScrapePrompt(companyName, careersUrl)}\n\nPage content:\n---\n${text}\n---`
+
+  const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: { 'Authorization': `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      model: 'gpt-4o-mini',
+      max_tokens: 4096,
+      temperature: 0,
+      messages: [{ role: 'user', content: prompt }],
+    }),
+  })
+  if (!res.ok) throw new Error(`OpenAI API error: ${await res.text()}`)
+  const data = await res.json()
+  return parseJobsFromText(data.choices[0].message.content, companyName, careersUrl)
+}
+
+function buildScrapePrompt(companyName: string, careersUrl: string): string {
+  return `Extract ALL job listings from the careers page of ${companyName}: ${careersUrl}
+
+Return ONLY a valid JSON array, no markdown fences, no explanation:
+[{"title":"...","url":"...","location":"..."}]
+
+- Every job must have a title
+- url must be absolute (https://...); if unavailable use ${careersUrl}
+- If no jobs found return []
+- Output ONLY the JSON array, nothing else`
+}
+
+function parseJobsFromText(text: string, companyName: string, careersUrl: string): JobListing[] {
+  // Strip markdown code fences if present
+  const cleaned = text.replace(/```[a-z]*\n?/gi, '').trim()
+  const jsonMatch = cleaned.match(/\[[\s\S]*\]/)
   if (!jsonMatch) return []
-
-  const parsed = JSON.parse(jsonMatch[0]) as Array<{ title: string; url: string; location?: string }>
-  return parsed
-    .filter(j => j.title)
-    .map(j => ({
-      title: j.title.trim(),
-      company: companyName,
-      url: j.url ?? careersUrl,
-      source: 'gemini-scrape',
-      posted_at: '',
-    }))
+  try {
+    const parsed = JSON.parse(jsonMatch[0]) as Array<{ title: string; url: string; location?: string }>
+    return parsed
+      .filter(j => j.title && typeof j.title === 'string')
+      .map(j => ({
+        title: j.title.trim(),
+        company: companyName,
+        url: (j.url && j.url.startsWith('http')) ? j.url : careersUrl,
+        source: 'ai-scrape',
+        posted_at: '',
+      }))
+  } catch {
+    return []
+  }
 }
 
 // ── ATS API auto-detection ────────────────────────────────────────────────────
