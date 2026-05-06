@@ -21,7 +21,8 @@ const corsHeaders = {
 }
 
 const GEMINI_MODEL = 'gemini-2.0-flash-lite'
-const SCAN_DELAY_MS = 2000  // delay between companies to avoid rate limiting
+const COMPANY_TIMEOUT_MS = 12000  // max time per company before giving up
+const BATCH_SIZE = 3              // parallel companies per batch
 
 interface JobListing {
   title: string
@@ -66,81 +67,78 @@ Deno.serve(async (req) => {
       (existingApps ?? []).map((a: Record<string, string>) => `${a.company?.toLowerCase()}::${a.role?.toLowerCase()}`)
     )
 
-    const results: JobListing[] = []
-    const errors: string[] = []
-    const scanLog: Array<{ company: string; url: string; status: 'ok' | 'error' | 'skipped'; method: string; found: number; new: number; error?: string }> = []
+    type LogEntry = { company: string; url: string; status: 'ok'|'error'; method: string; found: number; new: number; error?: string }
+    type ScanResult = { entry: LogEntry; jobs: JobListing[] }
+
     const scanRunId = crypto.randomUUID()
+    const openaiKey = Deno.env.get('OPENAI_API_KEY')
 
-    await supabase.from('scan_runs').insert({ id: scanRunId, user_id, status: 'running' })
+    await supabase.from('scan_runs').insert({ id: scanRunId, user_id, status: 'running' }).then(() => {})
 
-    let companyIdx = 0
-    for (const company of (companies ?? [])) {
-      if (companyIdx > 0) await sleep(SCAN_DELAY_MS)
-      companyIdx++
+    // scanCompany: fetch jobs for one company, return structured result
+    async function scanCompany(company: { name: string; careers_url: string; api_url?: string; api_provider?: string; [k: string]: unknown }): Promise<ScanResult> {
+      let jobs: JobListing[] = []
+      let method = 'unknown'
+      let logError: string | undefined
+
       try {
-        let jobs: JobListing[] = []
-
-        let method = 'unknown'
-        let logError: string | undefined
-
-        // Try direct ATS API first (fast, free, no tokens)
-        const api = detectApi(company)
-        if (api) {
-          method = api.type + '-api'
-          jobs = await scanViaDetectedApi(api, company.name)
-        } else {
-          const openaiKey = Deno.env.get('OPENAI_API_KEY')
-          try {
-            method = 'gemini'
-            jobs = await scanViaGemini(geminiKey, company.name, company.careers_url)
-          } catch (geminiErr) {
-            const errMsg = geminiErr instanceof Error ? geminiErr.message : String(geminiErr)
-            const isQuota = errMsg.includes('429') || errMsg.includes('quota')
-            if (isQuota) {
-              await sleep(10000)
-              try {
-                jobs = await scanViaGemini(geminiKey, company.name, company.careers_url)
-              } catch {
-                logError = 'Rate limited'
-                errors.push(`${company.name}: rate limited`)
-              }
-            } else if (openaiKey) {
-              method = 'openai'
-              jobs = await scanViaOpenAI(openaiKey, company.name, company.careers_url)
-            } else {
-              logError = simplifyError(errMsg)
-              errors.push(`${company.name}: ${logError}`)
-            }
-          }
+        const detected = detectApi(company)
+        if (detected) {
+          method = detected.type + '-api'
+          jobs = await withTimeout(scanViaDetectedApi(detected, company.name), COMPANY_TIMEOUT_MS)
+        } else if (geminiKey) {
+          method = 'gemini'
+          jobs = await withTimeout(scanViaGemini(geminiKey, company.name, company.careers_url), COMPANY_TIMEOUT_MS)
         }
-
-        let newCount = 0
-        for (const job of jobs) {
-          if (!passesFilter(job.title, positive, negative)) continue
-          if (existingUrls.has(job.url)) continue
-          const key = `${job.company.toLowerCase()}::${job.title.toLowerCase()}`
-          if (existingKeys.has(key)) continue
-          results.push(job)
-          existingUrls.add(job.url)
-          existingKeys.add(key)
-          newCount++
-        }
-
-        scanLog.push({
-          company: company.name,
-          url: company.careers_url,
-          status: logError ? 'error' : 'ok',
-          method,
-          found: jobs.length,
-          new: newCount,
-          ...(logError && { error: logError }),
-        })
       } catch (e) {
-        const msg = simplifyError(e instanceof Error ? e.message : String(e))
-        errors.push(`${company.name}: ${msg}`)
-        scanLog.push({ company: company.name, url: company.careers_url, status: 'error', method: 'unknown', found: 0, new: 0, error: msg })
+        const msg = e instanceof Error ? e.message : String(e)
+        const isQuota = msg.includes('429') || msg.includes('quota')
+        if (!isQuota && openaiKey) {
+          try {
+            method = 'openai'
+            jobs = await withTimeout(scanViaOpenAI(openaiKey, company.name, company.careers_url), COMPANY_TIMEOUT_MS)
+          } catch (e2) {
+            logError = simplifyError(e2 instanceof Error ? e2.message : String(e2))
+          }
+        } else {
+          logError = simplifyError(msg)
+        }
+      }
+
+      return {
+        jobs,
+        entry: { company: company.name, url: company.careers_url, status: logError ? 'error' : 'ok', method, found: jobs.length, new: 0, ...(logError && { error: logError }) },
       }
     }
+
+    // Run in batches of BATCH_SIZE in parallel
+    const companiesList = (companies ?? []) as { name: string; careers_url: string; api_url?: string; api_provider?: string; [k: string]: unknown }[]
+    const scanResults: ScanResult[] = []
+    for (let i = 0; i < companiesList.length; i += BATCH_SIZE) {
+      const batch = companiesList.slice(i, i + BATCH_SIZE)
+      const batchOut = await Promise.all(batch.map(c => scanCompany(c)))
+      scanResults.push(...batchOut)
+    }
+
+    // Deduplicate and count new
+    const results: JobListing[] = []
+    for (const { jobs, entry } of scanResults) {
+      let newCount = 0
+      for (const job of jobs) {
+        if (!passesFilter(job.title, positive, negative)) continue
+        if (existingUrls.has(job.url)) continue
+        const key = `${job.company.toLowerCase()}::${job.title.toLowerCase()}`
+        if (existingKeys.has(key)) continue
+        results.push(job)
+        existingUrls.add(job.url)
+        existingKeys.add(key)
+        newCount++
+      }
+      entry.new = newCount
+    }
+
+    const scanLog = scanResults.map(r => r.entry)
+    const errors = scanLog.filter(e => e.status === 'error').map(e => `${e.company}: ${e.error}`)
 
     await supabase.from('scan_runs').update({
       finished_at: new Date().toISOString(),
@@ -238,6 +236,13 @@ Return ONLY a valid JSON array, no markdown fences, no explanation:
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error('Timed out')), ms)),
+  ])
 }
 
 function simplifyError(msg: string): string {
