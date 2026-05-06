@@ -68,6 +68,7 @@ Deno.serve(async (req) => {
 
     const results: JobListing[] = []
     const errors: string[] = []
+    const scanLog: Array<{ company: string; url: string; status: 'ok' | 'error' | 'skipped'; method: string; found: number; new: number; error?: string }> = []
     const scanRunId = crypto.randomUUID()
 
     await supabase.from('scan_runs').insert({ id: scanRunId, user_id, status: 'running' })
@@ -79,39 +80,41 @@ Deno.serve(async (req) => {
       try {
         let jobs: JobListing[] = []
 
+        let method = 'unknown'
+        let logError: string | undefined
+
         // Try direct ATS API first (fast, free, no tokens)
         const api = detectApi(company)
         if (api) {
+          method = api.type + '-api'
           jobs = await scanViaDetectedApi(api, company.name)
-          console.log(`[api] ${company.name}: ${jobs.length} jobs`)
         } else {
-          // AI scraping fallback — Gemini (url_context) preferred, OpenAI (fetch+parse) second
           const openaiKey = Deno.env.get('OPENAI_API_KEY')
           try {
-            console.log(`[gemini] ${company.name}: scraping ${company.careers_url}`)
+            method = 'gemini'
             jobs = await scanViaGemini(geminiKey, company.name, company.careers_url)
-            console.log(`[gemini] ${company.name}: ${jobs.length} jobs`)
           } catch (geminiErr) {
             const errMsg = geminiErr instanceof Error ? geminiErr.message : String(geminiErr)
             const isQuota = errMsg.includes('429') || errMsg.includes('quota')
             if (isQuota) {
-              console.warn(`[gemini] ${company.name} rate limited — waiting 10s before retry`)
               await sleep(10000)
               try {
                 jobs = await scanViaGemini(geminiKey, company.name, company.careers_url)
               } catch {
-                errors.push(`${company.name}: Gemini quota exceeded, skipped`)
+                logError = 'Rate limited'
+                errors.push(`${company.name}: rate limited`)
               }
             } else if (openaiKey) {
-              console.warn(`[gemini] ${company.name} failed: ${errMsg}. Trying OpenAI...`)
+              method = 'openai'
               jobs = await scanViaOpenAI(openaiKey, company.name, company.careers_url)
-              console.log(`[openai] ${company.name}: ${jobs.length} jobs`)
             } else {
-              errors.push(`${company.name}: ${errMsg}`)
+              logError = simplifyError(errMsg)
+              errors.push(`${company.name}: ${logError}`)
             }
           }
         }
 
+        let newCount = 0
         for (const job of jobs) {
           if (!passesFilter(job.title, positive, negative)) continue
           if (existingUrls.has(job.url)) continue
@@ -120,11 +123,22 @@ Deno.serve(async (req) => {
           results.push(job)
           existingUrls.add(job.url)
           existingKeys.add(key)
+          newCount++
         }
+
+        scanLog.push({
+          company: company.name,
+          url: company.careers_url,
+          status: logError ? 'error' : 'ok',
+          method,
+          found: jobs.length,
+          new: newCount,
+          ...(logError && { error: logError }),
+        })
       } catch (e) {
-        const msg = `${company.name}: ${e instanceof Error ? e.message : e}`
-        console.error(msg)
-        errors.push(msg)
+        const msg = simplifyError(e instanceof Error ? e.message : String(e))
+        errors.push(`${company.name}: ${msg}`)
+        scanLog.push({ company: company.name, url: company.careers_url, status: 'error', method: 'unknown', found: 0, new: 0, error: msg })
       }
     }
 
@@ -135,7 +149,7 @@ Deno.serve(async (req) => {
       log: errors.length ? errors.join('\n') : null,
     }).eq('id', scanRunId)
 
-    return new Response(JSON.stringify({ results, scan_run_id: scanRunId, total: results.length, errors }), {
+    return new Response(JSON.stringify({ results, scan_run_id: scanRunId, total: results.length, errors, scan_log: scanLog }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     })
   } catch (err) {
@@ -224,6 +238,15 @@ Return ONLY a valid JSON array, no markdown fences, no explanation:
 
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
+}
+
+function simplifyError(msg: string): string {
+  if (msg.includes('429') || msg.includes('quota') || msg.includes('rate')) return 'Rate limited'
+  if (msg.includes('404') || msg.includes('not found')) return 'Page not found (404)'
+  if (msg.includes('timed out') || msg.includes('timeout')) return 'Timed out'
+  if (msg.includes('fetch') || msg.includes('network') || msg.includes('ECONNREFUSED')) return 'Could not reach page'
+  if (msg.includes('JSON') || msg.includes('parse')) return 'Unexpected page format'
+  return msg.slice(0, 80)
 }
 
 function parseJobsFromText(text: string, companyName: string, careersUrl: string): JobListing[] {

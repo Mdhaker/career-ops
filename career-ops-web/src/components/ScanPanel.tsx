@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { Loader2, Search, CheckCircle2, AlertCircle, Plus, ExternalLink } from 'lucide-react'
+import { Loader2, Search, CheckCircle2, AlertCircle, Plus, ExternalLink, ChevronDown, ChevronUp } from 'lucide-react'
 import { useScan, useEvaluate } from '@/hooks/useActions.ts'
 import { Button } from '@/components/ui/button.tsx'
 import { Card, CardContent, CardHeader, CardTitle, CardDescription } from '@/components/ui/card.tsx'
@@ -13,17 +13,42 @@ interface JobListing {
   posted_at?: string
 }
 
+interface ScanLogEntry {
+  company: string
+  url: string
+  status: 'ok' | 'error' | 'skipped'
+  method: string
+  found: number
+  new: number
+  error?: string
+}
+
+const METHOD_LABEL: Record<string, string> = {
+  'greenhouse-api': 'Greenhouse API',
+  'ashby-api': 'Ashby API',
+  'lever-api': 'Lever API',
+  'gemini': 'AI scrape',
+  'openai': 'AI scrape',
+  'generic-api': 'API',
+}
+
 export function ScanPanel({ onClose }: { onClose: () => void }) {
   const scan = useScan()
   const evaluate = useEvaluate()
   const [results, setResults] = useState<JobListing[]>([])
+  const [scanLog, setScanLog] = useState<ScanLogEntry[]>([])
   const [evaluated, setEvaluated] = useState<Set<string>>(new Set())
   const [evaluating, setEvaluating] = useState<string | null>(null)
   const [total, setTotal] = useState<number | null>(null)
+  const [logExpanded, setLogExpanded] = useState(false)
 
   const handleScan = async () => {
+    setResults([])
+    setScanLog([])
+    setEvaluated(new Set())
     const data = await scan.mutateAsync()
     setResults(data.results ?? [])
+    setScanLog(data.scan_log ?? [])
     setTotal(data.total ?? 0)
   }
 
@@ -98,6 +123,40 @@ export function ScanPanel({ onClose }: { onClose: () => void }) {
                   Rescan
                 </Button>
               </div>
+
+              {/* Scan log */}
+              {scanLog.length > 0 && (
+                <div className="mb-4 rounded-lg border border-gray-100 bg-gray-50 overflow-hidden">
+                  <button
+                    className="flex w-full items-center justify-between px-3 py-2 text-xs font-medium text-gray-500 hover:bg-gray-100"
+                    onClick={() => setLogExpanded(e => !e)}
+                  >
+                    <span>Scan log — {scanLog.length} companies</span>
+                    {logExpanded ? <ChevronUp className="h-3.5 w-3.5" /> : <ChevronDown className="h-3.5 w-3.5" />}
+                  </button>
+                  {logExpanded && (
+                    <div className="divide-y divide-gray-100 max-h-52 overflow-y-auto">
+                      {scanLog.map((entry, i) => (
+                        <div key={i} className="flex items-center gap-3 px-3 py-2">
+                          <span className={cn('shrink-0 h-1.5 w-1.5 rounded-full', entry.status === 'ok' ? 'bg-green-400' : 'bg-red-400')} />
+                          <span className="text-xs font-medium text-gray-700 w-28 shrink-0 truncate">{entry.company}</span>
+                          <span className="text-xs text-gray-400 w-20 shrink-0">{METHOD_LABEL[entry.method] ?? entry.method}</span>
+                          {entry.status === 'ok' ? (
+                            <span className="text-xs text-gray-500">
+                              {entry.found} found{entry.new > 0 ? `, ${entry.new} new` : ''}
+                            </span>
+                          ) : (
+                            <span className="text-xs text-red-500">{entry.error}</span>
+                          )}
+                          <a href={entry.url} target="_blank" rel="noopener noreferrer" className="ml-auto text-gray-300 hover:text-blue-400">
+                            <ExternalLink className="h-3 w-3" />
+                          </a>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
 
               {results.length === 0 ? (
                 <p className="rounded-lg border border-dashed border-gray-200 p-8 text-center text-sm text-gray-400">
