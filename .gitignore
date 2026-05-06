@@ -45,3 +45,7 @@ bun.lock
 .claude/memory/
 career-dashboard
 package-lock.json
+
+# Supabase CLI (root folder created by accidental link from wrong cwd)
+supabase/
+career-ops-web/supabase/.temp
