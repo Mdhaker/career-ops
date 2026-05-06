@@ -20,7 +20,8 @@ const corsHeaders = {
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 }
 
-const GEMINI_MODEL = 'gemini-2.0-flash'
+const GEMINI_MODEL = 'gemini-2.0-flash-lite'
+const SCAN_DELAY_MS = 2000  // delay between companies to avoid rate limiting
 
 interface JobListing {
   title: string
@@ -71,7 +72,10 @@ Deno.serve(async (req) => {
 
     await supabase.from('scan_runs').insert({ id: scanRunId, user_id, status: 'running' })
 
+    let companyIdx = 0
     for (const company of (companies ?? [])) {
+      if (companyIdx > 0) await sleep(SCAN_DELAY_MS)
+      companyIdx++
       try {
         let jobs: JobListing[] = []
 
@@ -88,10 +92,22 @@ Deno.serve(async (req) => {
             jobs = await scanViaGemini(geminiKey, company.name, company.careers_url)
             console.log(`[gemini] ${company.name}: ${jobs.length} jobs`)
           } catch (geminiErr) {
-            console.warn(`[gemini] ${company.name} failed: ${geminiErr}. Trying OpenAI...`)
-            if (openaiKey) {
+            const errMsg = geminiErr instanceof Error ? geminiErr.message : String(geminiErr)
+            const isQuota = errMsg.includes('429') || errMsg.includes('quota')
+            if (isQuota) {
+              console.warn(`[gemini] ${company.name} rate limited — waiting 10s before retry`)
+              await sleep(10000)
+              try {
+                jobs = await scanViaGemini(geminiKey, company.name, company.careers_url)
+              } catch {
+                errors.push(`${company.name}: Gemini quota exceeded, skipped`)
+              }
+            } else if (openaiKey) {
+              console.warn(`[gemini] ${company.name} failed: ${errMsg}. Trying OpenAI...`)
               jobs = await scanViaOpenAI(openaiKey, company.name, company.careers_url)
               console.log(`[openai] ${company.name}: ${jobs.length} jobs`)
+            } else {
+              errors.push(`${company.name}: ${errMsg}`)
             }
           }
         }
@@ -204,6 +220,10 @@ Return ONLY a valid JSON array, no markdown fences, no explanation:
 - url must be absolute (https://...); if unavailable use ${careersUrl}
 - If no jobs found return []
 - Output ONLY the JSON array, nothing else`
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
 }
 
 function parseJobsFromText(text: string, companyName: string, careersUrl: string): JobListing[] {
