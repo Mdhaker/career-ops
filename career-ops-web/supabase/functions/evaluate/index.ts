@@ -72,17 +72,20 @@ Deno.serve(async (req) => {
     const systemPrompt = buildSystemPrompt(profile)
     const userPrompt = buildEvaluationPrompt(jobUrl, jdContent)
 
-    // Call AI
+    // Call AI — uses whichever key is set (priority: Anthropic > OpenAI > Gemini)
     let report: string
     const anthropicKey = Deno.env.get('ANTHROPIC_API_KEY')
+    const openaiKey = Deno.env.get('OPENAI_API_KEY')
     const geminiKey = Deno.env.get('GEMINI_API_KEY')
 
     if (anthropicKey) {
       report = await callAnthropic(anthropicKey, systemPrompt, userPrompt)
+    } else if (openaiKey) {
+      report = await callOpenAI(openaiKey, systemPrompt, userPrompt)
     } else if (geminiKey) {
       report = await callGemini(geminiKey, systemPrompt, userPrompt)
     } else {
-      return new Response(JSON.stringify({ error: 'No AI API key configured. Set ANTHROPIC_API_KEY or GEMINI_API_KEY as Supabase secrets.' }), {
+      return new Response(JSON.stringify({ error: 'No AI API key configured. Set ANTHROPIC_API_KEY, OPENAI_API_KEY, or GEMINI_API_KEY as Supabase secrets.' }), {
         status: 500, headers: { ...corsHeaders, 'Content-Type': 'application/json' },
       })
     }
@@ -174,6 +177,27 @@ async function callAnthropic(apiKey: string, system: string, user: string): Prom
   if (!res.ok) throw new Error(`Anthropic API error: ${await res.text()}`)
   const data = await res.json()
   return data.content[0].text
+}
+
+async function callOpenAI(apiKey: string, system: string, user: string): Promise<string> {
+  const res = await fetch('https://api.openai.com/v1/chat/completions', {
+    method: 'POST',
+    headers: {
+      'Authorization': `Bearer ${apiKey}`,
+      'Content-Type': 'application/json',
+    },
+    body: JSON.stringify({
+      model: 'gpt-4o',
+      max_tokens: 8192,
+      messages: [
+        { role: 'system', content: system },
+        { role: 'user', content: user },
+      ],
+    }),
+  })
+  if (!res.ok) throw new Error(`OpenAI API error: ${await res.text()}`)
+  const data = await res.json()
+  return data.choices[0].message.content
 }
 
 async function callGemini(apiKey: string, system: string, user: string): Promise<string> {
