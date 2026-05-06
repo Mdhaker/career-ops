@@ -18,7 +18,7 @@
 
 4. Go to **SQL Editor** (left sidebar) → **New query**
 5. Paste the entire contents of `career-ops-web/supabase/schema.sql`
-6. Click **Run** — you should see `Success. No rows returned`
+6. Click **Run** — you should see `Success. No rows returned` 
 
 ### Get your credentials
 
