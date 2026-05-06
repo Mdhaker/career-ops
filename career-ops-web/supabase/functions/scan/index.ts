@@ -2,12 +2,15 @@
  * Edge Function: scan
  *
  * POST /functions/v1/scan
- * Body: { user_id: string }
+ * Body: { user_id: string, company_ids?: string[] }
  *
- * Reads tracked_companies + search_queries from DB,
- * hits ATS APIs directly (Greenhouse, Ashby, Lever),
- * filters by title_filters, deduplicates against existing applications,
- * returns new job listings (does NOT auto-evaluate — user reviews first).
+ * Reads tracked_companies + title_filters from DB.
+ * For each enabled company:
+ *   - If it has a detectable ATS API (Greenhouse/Ashby/Lever) → hits it directly
+ *   - Otherwise → asks Gemini to fetch and parse the careers page
+ * Deduplicates against existing applications, returns new listings.
+ *
+ * Required secrets: GEMINI_API_KEY
  */
 
 import { createClient } from 'https://esm.sh/@supabase/supabase-js@2'
@@ -16,6 +19,8 @@ const corsHeaders = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type',
 }
+
+const GEMINI_MODEL = 'gemini-2.5-flash-preview-04-17'
 
 interface JobListing {
   title: string
@@ -29,7 +34,9 @@ Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders })
 
   try {
-    const { user_id } = await req.json()
+    const { user_id, company_ids } = await req.json()
+    const geminiKey = Deno.env.get('GEMINI_API_KEY')
+    if (!geminiKey) throw new Error('GEMINI_API_KEY secret not set')
 
     const supabase = createClient(
       Deno.env.get('SUPABASE_URL')!,
@@ -37,47 +44,47 @@ Deno.serve(async (req) => {
     )
 
     // Load config from DB
+    let companiesQuery = supabase.from('tracked_companies').select('*').eq('user_id', user_id).eq('enabled', true)
+    if (company_ids?.length) companiesQuery = companiesQuery.in('id', company_ids)
+
     const [
       { data: companies },
       { data: titleFilter },
       { data: existingApps },
     ] = await Promise.all([
-      supabase.from('tracked_companies').select('*').eq('user_id', user_id).eq('enabled', true),
+      companiesQuery,
       supabase.from('title_filters').select('*').eq('user_id', user_id).maybeSingle(),
       supabase.from('applications').select('url, company, role').eq('user_id', user_id),
     ])
 
-    const positive = titleFilter?.positive ?? []
-    const negative = titleFilter?.negative ?? []
+    const positive: string[] = titleFilter?.positive ?? []
+    const negative: string[] = titleFilter?.negative ?? []
 
-    // Build dedup set from existing apps
-    const existingUrls = new Set((existingApps ?? []).map(a => a.url).filter(Boolean))
+    const existingUrls = new Set((existingApps ?? []).map((a: Record<string, string>) => a.url).filter(Boolean))
     const existingKeys = new Set(
-      (existingApps ?? []).map(a => `${a.company?.toLowerCase()}::${a.role?.toLowerCase()}`)
+      (existingApps ?? []).map((a: Record<string, string>) => `${a.company?.toLowerCase()}::${a.role?.toLowerCase()}`)
     )
 
     const results: JobListing[] = []
+    const errors: string[] = []
     const scanRunId = crypto.randomUUID()
 
-    // Insert scan run record
-    await supabase.from('scan_runs').insert({
-      id: scanRunId,
-      user_id,
-      status: 'running',
-    })
+    await supabase.from('scan_runs').insert({ id: scanRunId, user_id, status: 'running' })
 
     for (const company of (companies ?? [])) {
       try {
         let jobs: JobListing[] = []
 
-        if (company.scan_method === 'api' && company.api_url) {
-          jobs = await scanViaApi(company)
-        } else if (company.scan_method === 'playwright') {
-          // Playwright not available in Edge Functions — skip with note
-          console.log(`⚠️  ${company.name}: playwright scan requires CLI. Skipping in edge function.`)
-          continue
+        // Try direct ATS API first (fast, free)
+        const api = detectApi(company)
+        if (api) {
+          jobs = await scanViaDetectedApi(api, company.name)
+          console.log(`[api] ${company.name}: ${jobs.length} jobs`)
         } else {
-          continue
+          // Fall back to Gemini scraping
+          console.log(`[gemini] ${company.name}: scraping ${company.careers_url}`)
+          jobs = await scanViaGemini(geminiKey, company.name, company.careers_url)
+          console.log(`[gemini] ${company.name}: ${jobs.length} jobs`)
         }
 
         for (const job of jobs) {
@@ -90,18 +97,20 @@ Deno.serve(async (req) => {
           existingKeys.add(key)
         }
       } catch (e) {
-        console.error(`Error scanning ${company.name}: ${e}`)
+        const msg = `${company.name}: ${e instanceof Error ? e.message : e}`
+        console.error(msg)
+        errors.push(msg)
       }
     }
 
-    // Update scan run
     await supabase.from('scan_runs').update({
       finished_at: new Date().toISOString(),
       status: 'completed',
       new_count: results.length,
+      log: errors.length ? errors.join('\n') : null,
     }).eq('id', scanRunId)
 
-    return new Response(JSON.stringify({ results, scan_run_id: scanRunId, total: results.length }), {
+    return new Response(JSON.stringify({ results, scan_run_id: scanRunId, total: results.length, errors }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
     })
   } catch (err) {
@@ -111,21 +120,98 @@ Deno.serve(async (req) => {
   }
 })
 
-// ── ATS API scanners ──────────────────────────────────────────────────────────
+// ── Gemini scraper ────────────────────────────────────────────────────────────
 
-async function scanViaApi(company: { name: string; api_url: string; careers_url: string; api_provider: string | null }): Promise<JobListing[]> {
-  const provider = company.api_provider ?? detectProvider(company.api_url)
+async function scanViaGemini(apiKey: string, companyName: string, careersUrl: string): Promise<JobListing[]> {
+  const prompt = `You are a job listing extractor.
 
-  if (provider === 'greenhouse') return scanGreenhouse(company)
-  if (provider === 'ashby') return scanAshby(company)
-  if (provider === 'lever') return scanLever(company)
-  if (provider === 'teamtailor') return scanTeamtailor(company)
+Fetch the careers page at: ${careersUrl}
 
-  // Generic JSON fetch — try to extract jobs array
-  const res = await fetch(company.api_url, { headers: { 'User-Agent': 'Mozilla/5.0' } })
+Extract ALL job listings currently posted on that page.
+Return ONLY a JSON array, no markdown, no explanation:
+[
+  { "title": "...", "url": "...", "location": "..." },
+  ...
+]
+
+Rules:
+- Include every job you find, do not filter by relevance
+- URL must be the direct link to the job posting (absolute URL)
+- If no URL is available for a job, use the careers page URL
+- If the page has no jobs, return []
+- Return ONLY the JSON array, nothing else`
+
+  const res = await fetch(
+    `https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${apiKey}`,
+    {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        tools: [{ url_context: {} }],
+        generationConfig: { maxOutputTokens: 4096, temperature: 0 },
+      }),
+    }
+  )
+
+  if (!res.ok) {
+    const err = await res.text()
+    throw new Error(`Gemini API error: ${err.slice(0, 200)}`)
+  }
+
+  const data = await res.json()
+  const text: string = data.candidates?.[0]?.content?.parts?.[0]?.text ?? '[]'
+
+  // Extract JSON array from response
+  const jsonMatch = text.match(/\[\s*[\s\S]*\]/)
+  if (!jsonMatch) return []
+
+  const parsed = JSON.parse(jsonMatch[0]) as Array<{ title: string; url: string; location?: string }>
+  return parsed
+    .filter(j => j.title)
+    .map(j => ({
+      title: j.title.trim(),
+      company: companyName,
+      url: j.url ?? careersUrl,
+      source: 'gemini-scrape',
+      posted_at: '',
+    }))
+}
+
+// ── ATS API auto-detection ────────────────────────────────────────────────────
+
+interface DetectedApi { type: string; url: string }
+
+function detectApi(company: { careers_url: string; api_url?: string; api_provider?: string }): DetectedApi | null {
+  // Explicit api_url set by user
+  if (company.api_url) {
+    const provider = company.api_provider ?? detectProvider(company.api_url)
+    return { type: provider ?? 'generic', url: company.api_url }
+  }
+
+  const url = company.careers_url ?? ''
+
+  const ashby = url.match(/jobs\.ashbyhq\.com\/([^/?#]+)/)
+  if (ashby) return { type: 'ashby', url: `https://api.ashbyhq.com/posting-api/job-board/${ashby[1]}` }
+
+  const lever = url.match(/jobs\.lever\.co\/([^/?#]+)/)
+  if (lever) return { type: 'lever', url: `https://api.lever.co/v0/postings/${lever[1]}` }
+
+  const gh = url.match(/(?:boards|job-boards)(?:\.eu)?\.greenhouse\.io\/([^/?#]+)/)
+  if (gh) return { type: 'greenhouse', url: `https://boards-api.greenhouse.io/v1/boards/${gh[1]}/jobs` }
+
+  return null
+}
+
+async function scanViaDetectedApi(api: DetectedApi, companyName: string): Promise<JobListing[]> {
+  if (api.type === 'greenhouse') return scanGreenhouse({ name: companyName, api_url: api.url })
+  if (api.type === 'ashby') return scanAshby({ name: companyName, api_url: api.url, careers_url: '' })
+  if (api.type === 'lever') return scanLever({ name: companyName, api_url: api.url, careers_url: '' })
+
+  const res = await fetch(api.url, { headers: { 'User-Agent': 'Mozilla/5.0' } })
   if (!res.ok) return []
   const data = await res.json()
-  return extractGenericJobs(data, company.name, company.careers_url)
+  return extractGenericJobs(data, companyName, api.url)
 }
 
 async function scanGreenhouse(company: { name: string; api_url: string }): Promise<JobListing[]> {
@@ -218,6 +304,7 @@ function detectProvider(url: string): string | null {
   if (url.includes('teamtailor.com')) return 'teamtailor'
   return null
 }
+
 
 function passesFilter(title: string, positive: string[], negative: string[]): boolean {
   const t = title.toLowerCase()

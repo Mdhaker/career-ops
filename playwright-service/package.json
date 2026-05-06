@@ -1,0 +1,11 @@
+{
+  "name": "career-ops-playwright-service",
+  "type": "module",
+  "version": "1.0.0",
+  "scripts": {
+    "start": "node server.mjs"
+  },
+  "dependencies": {
+    "playwright": "^1.44.0"
+  }
+}
