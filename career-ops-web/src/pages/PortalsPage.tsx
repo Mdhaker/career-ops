@@ -1,5 +1,6 @@
 import { useState } from 'react'
-import { Plus, Trash2, Loader2, Globe, Search, Filter } from 'lucide-react'
+import { load as yamlLoad } from 'js-yaml'
+import { Plus, Trash2, Loader2, Globe, Search, Filter, Upload, CheckCircle2, AlertCircle } from 'lucide-react'
 import * as Tabs from '@radix-ui/react-tabs'
 import {
   useTrackedCompanies, useUpsertCompany, useDeleteCompany,
@@ -135,6 +136,188 @@ function QueryForm({ query, onClose }: { query?: SearchQuery; onClose: () => voi
   )
 }
 
+// ── YAML Import ─────────────────────────────────────────────────────────────
+
+interface ParsedPortalsYaml {
+  title_filter?: {
+    positive?: string[]
+    negative?: string[]
+    seniority_boost?: string[]
+  }
+  search_queries?: Array<{ name: string; query: string; enabled?: boolean }>
+  tracked_companies?: Array<{
+    name: string
+    careers_url: string
+    api_url?: string
+    api_provider?: TrackedCompany['api_provider']
+    scan_method?: TrackedCompany['scan_method']
+    notes?: string
+    enabled?: boolean
+  }>
+}
+
+interface ImportPreview {
+  companies: number
+  queries: number
+  hasFilter: boolean
+  parsed: ParsedPortalsYaml
+}
+
+function YamlImportPanel() {
+  const [yaml, setYaml] = useState('')
+  const [preview, setPreview] = useState<ImportPreview | null>(null)
+  const [parseError, setParseError] = useState<string | null>(null)
+  const [importing, setImporting] = useState(false)
+  const [result, setResult] = useState<{ companies: number; queries: number } | null>(null)
+
+  const upsertCompany = useUpsertCompany()
+  const upsertQuery = useUpsertSearchQuery()
+  const upsertFilter = useUpsertTitleFilter()
+
+  const handleParse = () => {
+    setParseError(null)
+    setPreview(null)
+    setResult(null)
+    try {
+      const parsed = yamlLoad(yaml) as ParsedPortalsYaml
+      if (!parsed || typeof parsed !== 'object') throw new Error('Invalid YAML — expected an object at root level')
+      setPreview({
+        companies: parsed.tracked_companies?.length ?? 0,
+        queries: parsed.search_queries?.length ?? 0,
+        hasFilter: !!parsed.title_filter,
+        parsed,
+      })
+    } catch (e) {
+      setParseError(e instanceof Error ? e.message : 'Failed to parse YAML')
+    }
+  }
+
+  const handleImport = async () => {
+    if (!preview) return
+    setImporting(true)
+    const { parsed } = preview
+    let companiesImported = 0
+    let queriesImported = 0
+
+    try {
+      if (parsed.title_filter) {
+        await upsertFilter.mutateAsync({
+          positive: parsed.title_filter.positive ?? [],
+          negative: parsed.title_filter.negative ?? [],
+          seniority_boost: parsed.title_filter.seniority_boost ?? [],
+        })
+      }
+
+      for (const c of parsed.tracked_companies ?? []) {
+        if (!c.name || !c.careers_url) continue
+        await upsertCompany.mutateAsync({
+          name: c.name,
+          careers_url: c.careers_url,
+          api_url: c.api_url ?? null,
+          api_provider: c.api_provider ?? null,
+          scan_method: c.scan_method ?? 'playwright',
+          notes: c.notes ?? null,
+          enabled: c.enabled ?? true,
+        })
+        companiesImported++
+      }
+
+      for (const q of parsed.search_queries ?? []) {
+        if (!q.name || !q.query) continue
+        await upsertQuery.mutateAsync({
+          name: q.name,
+          query: q.query,
+          enabled: q.enabled ?? true,
+        })
+        queriesImported++
+      }
+
+      setResult({ companies: companiesImported, queries: queriesImported })
+      setPreview(null)
+      setYaml('')
+    } catch (e) {
+      setParseError(e instanceof Error ? e.message : 'Import failed')
+    } finally {
+      setImporting(false)
+    }
+  }
+
+  return (
+    <div className="space-y-4">
+      <Card>
+        <CardHeader>
+          <CardTitle className="text-base flex items-center gap-2">
+            <Upload className="h-4 w-4" />
+            Import from portals.yml
+          </CardTitle>
+          <CardDescription>
+            Paste the contents of your <code className="font-mono text-xs bg-gray-100 px-1 py-0.5 rounded">portals.yml</code> file.
+            Existing companies and queries with the same name will be updated; new ones will be added.
+          </CardDescription>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          <div className="space-y-1.5">
+            <Label>YAML content</Label>
+            <textarea
+              rows={18}
+              value={yaml}
+              onChange={e => { setYaml(e.target.value); setPreview(null); setParseError(null); setResult(null) }}
+              placeholder={`title_filter:\n  positive:\n    - AI\n    - LLM\n  negative:\n    - Junior\n\nsearch_queries:\n  - name: Ashby — AI PM\n    query: 'site:jobs.ashbyhq.com "AI Product Manager"'\n    enabled: true\n\ntracked_companies:\n  - name: Anthropic\n    careers_url: https://www.anthropic.com/careers\n    scan_method: playwright\n    enabled: true`}
+              className="flex w-full rounded-md border border-gray-300 bg-white px-3 py-2 font-mono text-xs shadow-sm focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-blue-500"
+            />
+          </div>
+
+          {parseError && (
+            <div className="flex items-start gap-2 rounded-md bg-red-50 border border-red-200 p-3">
+              <AlertCircle className="h-4 w-4 text-red-500 mt-0.5 shrink-0" />
+              <p className="text-sm text-red-700">{parseError}</p>
+            </div>
+          )}
+
+          {result && (
+            <div className="flex items-start gap-2 rounded-md bg-green-50 border border-green-200 p-3">
+              <CheckCircle2 className="h-4 w-4 text-green-600 mt-0.5 shrink-0" />
+              <p className="text-sm text-green-700">
+                Import complete — <strong>{result.companies}</strong> companies and <strong>{result.queries}</strong> queries imported.
+              </p>
+            </div>
+          )}
+
+          {preview && (
+            <div className="rounded-md border border-blue-200 bg-blue-50 p-4 space-y-2">
+              <p className="text-sm font-medium text-blue-800">Preview — ready to import:</p>
+              <ul className="text-sm text-blue-700 space-y-1">
+                <li>• <strong>{preview.companies}</strong> tracked companies</li>
+                <li>• <strong>{preview.queries}</strong> search queries</li>
+                {preview.hasFilter && <li>• Title filters (positive / negative / seniority boost)</li>}
+              </ul>
+              <p className="text-xs text-blue-600 mt-1">
+                Existing entries with the same name will be updated; new ones added. Nothing is deleted.
+              </p>
+            </div>
+          )}
+
+          <div className="flex gap-2">
+            <Button
+              variant="outline"
+              onClick={handleParse}
+              disabled={!yaml.trim()}
+            >
+              Parse YAML
+            </Button>
+            {preview && (
+              <Button onClick={handleImport} disabled={importing} className="gap-1.5">
+                {importing ? <Loader2 className="h-4 w-4 animate-spin" /> : <Upload className="h-4 w-4" />}
+                Import {preview.companies + preview.queries + (preview.hasFilter ? 1 : 0)} items
+              </Button>
+            )}
+          </div>
+        </CardContent>
+      </Card>
+    </div>
+  )
+}
+
 function TitleFilterPanel() {
   const { data: filter } = useTitleFilter()
   const upsert = useUpsertTitleFilter()
@@ -218,6 +401,7 @@ export function PortalsPage() {
             { value: 'companies', label: 'Tracked Companies', icon: Globe },
             { value: 'queries', label: 'Search Queries', icon: Search },
             { value: 'filters', label: 'Title Filters', icon: Filter },
+            { value: 'import', label: 'Import YAML', icon: Upload },
           ].map(({ value, label, icon: Icon }) => (
             <Tabs.Trigger
               key={value}
@@ -326,6 +510,10 @@ export function PortalsPage() {
 
         <Tabs.Content value="filters">
           <TitleFilterPanel />
+        </Tabs.Content>
+
+        <Tabs.Content value="import">
+          <YamlImportPanel />
         </Tabs.Content>
       </Tabs.Root>
 
