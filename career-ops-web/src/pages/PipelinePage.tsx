@@ -1,5 +1,7 @@
 import { useState } from 'react'
-import { Plus, ExternalLink, FileText, Loader2, ChevronDown } from 'lucide-react'
+import { Plus, ExternalLink, FileText, Loader2, ChevronDown, Sparkles, Search } from 'lucide-react'
+import { EvaluateModal } from '@/components/EvaluateModal.tsx'
+import { ScanPanel } from '@/components/ScanPanel.tsx'
 import { useApplications, useUpdateApplicationStatus, useDeleteApplication, useCreateApplication } from '@/hooks/useApplications.ts'
 import { Button } from '@/components/ui/button.tsx'
 import { Badge } from '@/components/ui/badge.tsx'
@@ -207,6 +209,8 @@ function ApplicationCard({ app }: { app: Application }) {
 export function PipelinePage() {
   const { data: applications = [], isLoading } = useApplications()
   const [showAdd, setShowAdd] = useState(false)
+  const [showEvaluate, setShowEvaluate] = useState(false)
+  const [showScan, setShowScan] = useState(false)
   const [search, setSearch] = useState('')
   const [view, setView] = useState<'kanban' | 'list'>('kanban')
 
@@ -247,6 +251,12 @@ export function PipelinePage() {
           >
             List
           </button>
+          <Button size="sm" variant="outline" onClick={() => setShowScan(true)} className="gap-1.5">
+            <Search className="h-4 w-4" /> Scan
+          </Button>
+          <Button size="sm" variant="outline" onClick={() => setShowEvaluate(true)} className="gap-1.5">
+            <Sparkles className="h-4 w-4" /> Evaluate
+          </Button>
           <Button size="sm" onClick={() => setShowAdd(true)} className="gap-1.5">
             <Plus className="h-4 w-4" /> Add
           </Button>
@@ -348,6 +358,8 @@ export function PipelinePage() {
       )}
 
       {showAdd && <AddApplicationModal onClose={() => setShowAdd(false)} />}
+      {showEvaluate && <EvaluateModal onClose={() => setShowEvaluate(false)} />}
+      {showScan && <ScanPanel onClose={() => setShowScan(false)} />}
     </div>
   )
 }
