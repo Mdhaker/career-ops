@@ -80,6 +80,11 @@ Deno.serve(async (req) => {
 
     const scanRunId = crypto.randomUUID()
     const openaiKey = Deno.env.get('OPENAI_API_KEY')
+
+    // Support multiple Gemini keys (comma-separated) for quota rotation
+    const geminiKeysRaw = Deno.env.get('GEMINI_API_KEYS') || Deno.env.get('GEMINI_API_KEY') || ''
+    const geminiKeys = geminiKeysRaw.split(',').map((k: string) => k.trim()).filter(Boolean)
+    let currentKeyIndex = 0
     let lastGeminiCall = 0
 
     console.log(`[scan] Starting scan run: ${scanRunId.slice(0, 8)}...`)
@@ -90,15 +95,33 @@ Deno.serve(async (req) => {
       console.log('[scan] Scan run inserted')
     }
 
-    // Rate-limited Gemini call wrapper
+    // Rate-limited Gemini call wrapper with key rotation on 429
     async function callGeminiRateLimited(companyName: string, careersUrl: string): Promise<JobListing[]> {
       const now = Date.now()
       const elapsed = now - lastGeminiCall
       if (elapsed < GEMINI_MIN_GAP_MS) {
         await sleep(GEMINI_MIN_GAP_MS - elapsed)
       }
-      lastGeminiCall = Date.now()
-      return scanViaGemini(geminiKey, companyName, careersUrl)
+
+      while (currentKeyIndex < geminiKeys.length) {
+        const key = geminiKeys[currentKeyIndex]
+        lastGeminiCall = Date.now()
+        try {
+          console.log(`[scan:${companyName}] Using Gemini key #${currentKeyIndex + 1}/${geminiKeys.length}`)
+          return await scanViaGemini(key, companyName, careersUrl)
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e)
+          if (msg.includes('429') || msg.includes('quota')) {
+            console.warn(`[scan:${companyName}] Key #${currentKeyIndex + 1} quota exceeded, rotating...`)
+            currentKeyIndex++
+            if (currentKeyIndex >= geminiKeys.length) break
+            // Continue loop with next key
+          } else {
+            throw e // Non-quota error, propagate it
+          }
+        }
+      }
+      throw new Error('All Gemini keys quota exceeded')
     }
 
     // scanCompany: fetch jobs for one company, return structured result
