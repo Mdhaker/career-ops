@@ -50,15 +50,22 @@ Deno.serve(async (req) => {
     let companiesQuery = supabase.from('tracked_companies').select('*').eq('user_id', user_id).eq('enabled', true)
     if (company_ids?.length) companiesQuery = companiesQuery.in('id', company_ids)
 
+    console.log(`[scan] Fetching config for user: ${user_id?.slice(0, 8)}...`)
+
     const [
-      { data: companies },
-      { data: titleFilter },
-      { data: existingApps },
+      { data: companies, error: companiesErr },
+      { data: titleFilter, error: filterErr },
+      { data: existingApps, error: appsErr },
     ] = await Promise.all([
       companiesQuery,
       supabase.from('title_filters').select('*').eq('user_id', user_id).maybeSingle(),
       supabase.from('applications').select('url, company, role').eq('user_id', user_id),
     ])
+
+    console.log(`[scan] Companies: ${companies?.length ?? 0}, Filter: ${titleFilter ? 'yes' : 'no'}, Existing apps: ${existingApps?.length ?? 0}`)
+    if (companiesErr) console.error('[scan] Companies error:', companiesErr)
+    if (filterErr) console.error('[scan] Filter error:', filterErr)
+    if (appsErr) console.error('[scan] Apps error:', appsErr)
 
     const positive: string[] = titleFilter?.positive ?? []
     const negative: string[] = titleFilter?.negative ?? []
@@ -75,7 +82,13 @@ Deno.serve(async (req) => {
     const openaiKey = Deno.env.get('OPENAI_API_KEY')
     let lastGeminiCall = 0
 
-    await supabase.from('scan_runs').insert({ id: scanRunId, user_id, status: 'running' }).then(() => {})
+    console.log(`[scan] Starting scan run: ${scanRunId.slice(0, 8)}...`)
+    const { error: runInsertErr } = await supabase.from('scan_runs').insert({ id: scanRunId, user_id, status: 'running' })
+    if (runInsertErr) {
+      console.error('[scan] Failed to insert scan run:', runInsertErr)
+    } else {
+      console.log('[scan] Scan run inserted')
+    }
 
     // Rate-limited Gemini call wrapper
     async function callGeminiRateLimited(companyName: string, careersUrl: string): Promise<JobListing[]> {
@@ -90,27 +103,39 @@ Deno.serve(async (req) => {
 
     // scanCompany: fetch jobs for one company, return structured result
     async function scanCompany(company: { name: string; careers_url: string; api_url?: string; api_provider?: string; [k: string]: unknown }): Promise<ScanResult> {
+      console.log(`[scan:${company.name}] Starting...`)
       let jobs: JobListing[] = []
       let method = 'unknown'
       let logError: string | undefined
 
       try {
+        console.log(`[scan:${company.name}] Detecting API...`)
         const detected = detectApi(company)
         if (detected) {
           method = detected.type + '-api'
+          console.log(`[scan:${company.name}] Using ${method}: ${detected.url}`)
           jobs = await withTimeout(scanViaDetectedApi(detected, company.name), COMPANY_TIMEOUT_MS)
+          console.log(`[scan:${company.name}] API returned ${jobs.length} jobs`)
         } else if (geminiKey) {
           method = 'gemini'
+          console.log(`[scan:${company.name}] Using Gemini to scrape: ${company.careers_url}`)
           jobs = await withTimeout(callGeminiRateLimited(company.name, company.careers_url), COMPANY_TIMEOUT_MS)
+          console.log(`[scan:${company.name}] Gemini returned ${jobs.length} jobs`)
+        } else {
+          console.log(`[scan:${company.name}] No API detected and no Gemini key available`)
         }
       } catch (e) {
+        console.error(`[scan:${company.name}] Error:`, e)
         const msg = e instanceof Error ? e.message : String(e)
         const isQuota = msg.includes('429') || msg.includes('quota')
         if (!isQuota && openaiKey) {
+          console.log(`[scan:${company.name}] Trying OpenAI fallback...`)
           try {
             method = 'openai'
             jobs = await withTimeout(scanViaOpenAI(openaiKey, company.name, company.careers_url), COMPANY_TIMEOUT_MS)
+            console.log(`[scan:${company.name}] OpenAI returned ${jobs.length} jobs`)
           } catch (e2) {
+            console.error(`[scan:${company.name}] OpenAI fallback failed:`, e2)
             logError = simplifyError(e2 instanceof Error ? e2.message : String(e2))
           }
         } else {
@@ -126,11 +151,27 @@ Deno.serve(async (req) => {
 
     // Run in batches of BATCH_SIZE in parallel
     const companiesList = (companies ?? []) as { name: string; careers_url: string; api_url?: string; api_provider?: string; [k: string]: unknown }[]
+    console.log(`[scan] Processing ${companiesList.length} companies in batches of ${BATCH_SIZE}`)
+
     const scanResults: ScanResult[] = []
     for (let i = 0; i < companiesList.length; i += BATCH_SIZE) {
       const batch = companiesList.slice(i, i + BATCH_SIZE)
-      const batchOut = await Promise.all(batch.map(c => scanCompany(c)))
+      console.log(`[scan] Batch ${Math.floor(i/BATCH_SIZE) + 1}/${Math.ceil(companiesList.length/BATCH_SIZE)}: ${batch.map(c => c.name).join(', ')}`)
+
+      let batchOut: ScanResult[]
+      try {
+        batchOut = await Promise.all(batch.map(c => scanCompany(c)))
+      } catch (batchErr) {
+        console.error(`[scan] Batch failed:`, batchErr)
+        // Create error entries for all companies in failed batch
+        batchOut = batch.map(c => ({
+          entry: { company: c.name, url: c.careers_url, status: 'error' as const, method: 'unknown', found: 0, new: 0, error: `Batch failed: ${batchErr instanceof Error ? batchErr.message : String(batchErr)}` },
+          jobs: [] as JobListing[],
+        }))
+      }
+
       scanResults.push(...batchOut)
+      console.log(`[scan] Batch results: ${batchOut.map(r => `${r.entry.company}:${r.entry.status}`).join(', ')}`)
     }
 
     // Deduplicate and count new
@@ -153,12 +194,16 @@ Deno.serve(async (req) => {
     const scanLog = scanResults.map(r => r.entry)
     const errors = scanLog.filter(e => e.status === 'error').map(e => `${e.company}: ${e.error}`)
 
-    await supabase.from('scan_runs').update({
+    console.log(`[scan] Finished. New jobs: ${results.length}, Errors: ${errors.length}`)
+
+    const { error: runUpdateErr } = await supabase.from('scan_runs').update({
       finished_at: new Date().toISOString(),
-      status: 'completed',
+      status: errors.length ? 'completed_with_errors' : 'completed',
       new_count: results.length,
       log: errors.length ? errors.join('\n') : null,
     }).eq('id', scanRunId)
+
+    if (runUpdateErr) console.error('[scan] Failed to update scan run:', runUpdateErr)
 
     return new Response(JSON.stringify({ results, scan_run_id: scanRunId, total: results.length, errors, scan_log: scanLog }), {
       headers: { ...corsHeaders, 'Content-Type': 'application/json' },
