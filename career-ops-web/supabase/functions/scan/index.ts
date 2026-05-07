@@ -22,7 +22,8 @@ const corsHeaders = {
 
 const GEMINI_MODEL = 'gemini-2.0-flash-lite'
 const COMPANY_TIMEOUT_MS = 12000  // max time per company before giving up
-const BATCH_SIZE = 3              // parallel companies per batch
+const BATCH_SIZE = 3              // parallel companies per batch (API calls only)
+const GEMINI_MIN_GAP_MS = 4000    // ~15 RPM free tier limit (4s between Gemini calls)
 
 interface JobListing {
   title: string
@@ -72,8 +73,20 @@ Deno.serve(async (req) => {
 
     const scanRunId = crypto.randomUUID()
     const openaiKey = Deno.env.get('OPENAI_API_KEY')
+    let lastGeminiCall = 0
 
     await supabase.from('scan_runs').insert({ id: scanRunId, user_id, status: 'running' }).then(() => {})
+
+    // Rate-limited Gemini call wrapper
+    async function callGeminiRateLimited(companyName: string, careersUrl: string): Promise<JobListing[]> {
+      const now = Date.now()
+      const elapsed = now - lastGeminiCall
+      if (elapsed < GEMINI_MIN_GAP_MS) {
+        await sleep(GEMINI_MIN_GAP_MS - elapsed)
+      }
+      lastGeminiCall = Date.now()
+      return scanViaGemini(geminiKey, companyName, careersUrl)
+    }
 
     // scanCompany: fetch jobs for one company, return structured result
     async function scanCompany(company: { name: string; careers_url: string; api_url?: string; api_provider?: string; [k: string]: unknown }): Promise<ScanResult> {
@@ -88,7 +101,7 @@ Deno.serve(async (req) => {
           jobs = await withTimeout(scanViaDetectedApi(detected, company.name), COMPANY_TIMEOUT_MS)
         } else if (geminiKey) {
           method = 'gemini'
-          jobs = await withTimeout(scanViaGemini(geminiKey, company.name, company.careers_url), COMPANY_TIMEOUT_MS)
+          jobs = await withTimeout(callGeminiRateLimited(company.name, company.careers_url), COMPANY_TIMEOUT_MS)
         }
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e)
