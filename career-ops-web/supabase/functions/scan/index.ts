@@ -22,7 +22,7 @@ const corsHeaders = {
 
 const GEMINI_MODEL = 'gemini-2.0-flash-lite'
 const COMPANY_TIMEOUT_MS = 12000  // max time per company before giving up
-const BATCH_SIZE = 3              // parallel companies per batch (API calls only)
+const BATCH_SIZE = 1              // sequential (rate limiting requires serialization)
 const GEMINI_MIN_GAP_MS = 4000    // ~15 RPM free tier limit (4s between Gemini calls)
 
 interface JobListing {
@@ -149,29 +149,26 @@ Deno.serve(async (req) => {
       }
     }
 
-    // Run in batches of BATCH_SIZE in parallel
+    // Process companies sequentially to respect Gemini 4s rate limit
     const companiesList = (companies ?? []) as { name: string; careers_url: string; api_url?: string; api_provider?: string; [k: string]: unknown }[]
-    console.log(`[scan] Processing ${companiesList.length} companies in batches of ${BATCH_SIZE}`)
+    console.log(`[scan] Processing ${companiesList.length} companies sequentially (4s gap for Gemini)`)
 
     const scanResults: ScanResult[] = []
-    for (let i = 0; i < companiesList.length; i += BATCH_SIZE) {
-      const batch = companiesList.slice(i, i + BATCH_SIZE)
-      console.log(`[scan] Batch ${Math.floor(i/BATCH_SIZE) + 1}/${Math.ceil(companiesList.length/BATCH_SIZE)}: ${batch.map(c => c.name).join(', ')}`)
+    for (let i = 0; i < companiesList.length; i++) {
+      const company = companiesList[i]
+      console.log(`[scan] ${i + 1}/${companiesList.length}: ${company.name}`)
 
-      let batchOut: ScanResult[]
       try {
-        batchOut = await Promise.all(batch.map(c => scanCompany(c)))
-      } catch (batchErr) {
-        console.error(`[scan] Batch failed:`, batchErr)
-        // Create error entries for all companies in failed batch
-        batchOut = batch.map(c => ({
-          entry: { company: c.name, url: c.careers_url, status: 'error' as const, method: 'unknown', found: 0, new: 0, error: `Batch failed: ${batchErr instanceof Error ? batchErr.message : String(batchErr)}` },
-          jobs: [] as JobListing[],
-        }))
+        const result = await scanCompany(company)
+        scanResults.push(result)
+        console.log(`[scan] ${company.name}: ${result.entry.status} (${result.entry.found} jobs)`)
+      } catch (err) {
+        console.error(`[scan] ${company.name} crashed:`, err)
+        scanResults.push({
+          entry: { company: company.name, url: company.careers_url, status: 'error' as const, method: 'unknown', found: 0, new: 0, error: `Crash: ${err instanceof Error ? err.message : String(err)}` },
+          jobs: [],
+        })
       }
-
-      scanResults.push(...batchOut)
-      console.log(`[scan] Batch results: ${batchOut.map(r => `${r.entry.company}:${r.entry.status}`).join(', ')}`)
     }
 
     // Deduplicate and count new
